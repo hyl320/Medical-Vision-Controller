@@ -1,0 +1,29 @@
+# ========================
+# C++ 视觉底座项目 .gitignore
+# ========================
+
+# 1. 屏蔽所有 CMake 和编译器的生成黑洞
+out/
+build/
+bin/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# 2. 屏蔽 Visual Studio 的本地缓存（极其臃肿）
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# 3. 屏蔽所有的二进制“砖头”和调试符号
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+
+# 4. 屏蔽可能会不小心放进来的图片或视频缓存
+*.mp4
+*.avi
