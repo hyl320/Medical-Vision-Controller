@@ -48,6 +48,11 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile "third_party/$archive"
           Expand-Archive -Path "third_party/$archive" -DestinationPath third_party -Force
 
+      - name: Enable MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure CMake
         run: >
           cmake
@@ -55,6 +60,8 @@ jobs:
           -B ${{ env.BUILD_DIR }}
           -G Ninja
           -D CMAKE_BUILD_TYPE=Release
+          -D CMAKE_C_COMPILER=cl
+          -D CMAKE_CXX_COMPILER=cl
           -D OpenCV_DIR="C:/tools/opencv/build"
           -D ONNXRUNTIME_DIR="${{ env.ONNXRUNTIME_DIR }}"
 
