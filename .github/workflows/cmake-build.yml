@@ -68,12 +68,26 @@ jobs:
       - name: Build
         run: cmake --build ${{ env.BUILD_DIR }} --config Release
 
+      - name: Prepare portable application package
+        shell: pwsh
+        run: |
+          $package = "build/package"
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+          Copy-Item "${env:BUILD_DIR}/VisionApp.exe" $package -Force
+          Copy-Item "${env:BUILD_DIR}/*.dll" $package -Force
+          Copy-Item "config.json" $package -Force
+          New-Item -ItemType Directory -Force -Path "$package/models" | Out-Null
+          Copy-Item "models/best.onnx" "$package/models" -Force
+          windeployqt `
+            --release `
+            --no-translations `
+            --compiler-runtime `
+            --dir $package `
+            "$package/VisionApp.exe"
+
       - name: Upload executable artifact
         uses: actions/upload-artifact@v4
         with:
           name: VisionApp-windows
-          path: |
-            313_part1/${{ env.BUILD_DIR }}/VisionApp.exe
-            313_part1/${{ env.BUILD_DIR }}/*.dll
-            313_part1/config.json
+          path: 313_part1/build/package
           if-no-files-found: error
