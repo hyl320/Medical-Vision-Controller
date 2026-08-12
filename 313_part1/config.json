@@ -1,0 +1,22 @@
+{
+  "Network": {
+    "target_ip": "127.0.0.1",
+    "udp_port": 8888
+  },
+  "Camera": {
+    "fx": 500.0,
+    "fy": 500.0,
+    "cx": 320.0,
+    "cy": 240.0
+  },
+  "Control": {
+    "filter_alpha": 0.25,
+    "heartbeat_timeout_ms": 500
+  },
+  "Safety": {
+    "min_x_mm": -200.0,
+    "max_x_mm": 200.0,
+    "min_y_mm": -150.0,
+    "max_y_mm": 150.0
+  }
+}

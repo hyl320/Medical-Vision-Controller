@@ -1,17 +1,15 @@
+#include "ConfigManager.h"
 #include "VisionProcessor.h"
 
 #include "Letterbox.h"
+#include "Logger.h"
 
 #include <algorithm>
 #include <chrono>
-#include <iomanip>
-#include <iostream>
-
 #include <cstring>
+#include <iomanip>
 #include <sstream>
 #include <string>
-
-
 
 VisionProcessor::VisionProcessor() = default;
 
@@ -22,7 +20,27 @@ VisionProcessor::~VisionProcessor() {
 bool VisionProcessor::init(const std::string& model_path, int camera_id, int infer_interval_ms) {
     infer_interval_ms_ = infer_interval_ms;
 
+    const AppConfig& config = ConfigManager::instance().config();
+    camera_intrinsics_ = CameraIntrinsics{
+        config.camera.fx,
+        config.camera.fy,
+        config.camera.cx,
+        config.camera.cy
+    };
+    center_filter_alpha_ = static_cast<float>(config.control.filter_alpha);
+    watchdog_timeout_ms_ = config.control.heartbeat_timeout_ms;
+    safe_zone_ = SafeZone{
+        config.safety.min_x_mm,
+        config.safety.max_x_mm,
+        config.safety.min_y_mm,
+        config.safety.max_y_mm
+    };
+
+    Logger::Init();
+    Logger::LogInfo("System startup");
+
     if (!model_.load(model_path)) {
+        Logger::LogCritical("Model load failed");
         return false;
     }
 
@@ -36,8 +54,17 @@ bool VisionProcessor::init(const std::string& model_path, int camera_id, int inf
     message_thread_ = std::thread(&VisionProcessor::messageLoop, this);
     watchdog_thread_ = std::thread(&VisionProcessor::watchdogLoop, this);
     inference_thread_ = std::thread(&VisionProcessor::inferenceLoop, this);
-
     return true;
+}
+
+void VisionProcessor::setCoordinateDebugEnabled(bool enabled) {
+    coordinate_debug_enabled_ = enabled;
+    Logger::SetDebugEnabled(enabled);
+    Logger::LogInfo(enabled ? "3D coordinate debug enabled" : "3D coordinate debug disabled");
+}
+
+bool VisionProcessor::isCoordinateDebugEnabled() const {
+    return coordinate_debug_enabled_.load();
 }
 
 void VisionProcessor::publishRobotMessage(const RobotMessage& message) {
@@ -60,33 +87,33 @@ void VisionProcessor::publishWorldCoordinate(const WorldPoint3D& world) {
 }
 
 bool VisionProcessor::processFrame(cv::Mat& output_frame) {
+    const auto frame_time = std::chrono::high_resolution_clock::now();
     checkWatchdogTimeout();
     SystemState system_state = getSystemState();
     long long heartbeat_age_ms = getHeartbeatAgeMs();
 
+    const auto camera_read_start = std::chrono::high_resolution_clock::now();
     cv::Mat current_frame;
     if (!sensor_.getNextFrame(current_frame)) {
         return false;
     }
+    const auto camera_read_end = std::chrono::high_resolution_clock::now();
 
     {
-        // 把最新原始画面交给后台线程，供下一次推理使用。
         std::lock_guard<std::mutex> lock(frame_mutex_);
         latest_camera_frame_ = current_frame.clone();
     }
 
-    // 显示画面也使用 640x640，保证坐标系和推理结果一致。
     output_frame = Letterbox(current_frame, cv::Size(640, 640));
+    updateFrameStats(frame_time, camera_read_start, camera_read_end);
 
     InferenceResult result_copy;
     RobotMessage robot_message_copy = getLatestRobotMessage();
     {
-        // 复制最近一次推理结果；真正画图放在锁外，避免阻塞后台线程。
         std::lock_guard<std::mutex> lock(result_mutex_);
         result_copy = latest_result_;
     }
 
-    // 每一帧都复用最近一次检测框和 mask，让画面持续有结果显示。
     model_.drawResult(output_frame, result_copy);
     drawUiOverlay(output_frame, robot_message_copy, system_state);
     drawDashboard(output_frame, system_state, heartbeat_age_ms);
@@ -119,7 +146,7 @@ void VisionProcessor::messageLoop() {
             std::unique_lock<std::mutex> lock(world_mutex_);
             world_cv_.wait(lock, [this]() {
                 return has_new_robot_message_ || !running_;
-                });
+            });
 
             if (!running_) {
                 break;
@@ -137,17 +164,20 @@ void VisionProcessor::messageLoop() {
         }
 
         if (system_state == SystemState::TRACKING && robot_message.state == RobotState::SAFE) {
-            std::cout << std::fixed << std::setprecision(2)
-                << "World 3D X: " << world.x_mm << " mm, "
-                << "Y: " << world.y_mm << " mm, "
-                << "Z: " << world.z_mm << " mm"
-                << std::defaultfloat << std::setprecision(6) << std::endl;
+            if (coordinate_debug_enabled_) {
+                Logger::LogDebug(
+                    "World 3D X: " + std::to_string(world.x_mm) +
+                    " mm, Y: " + std::to_string(world.y_mm) +
+                    " mm, Z: " + std::to_string(world.z_mm) + " mm"
+                );
+            }
 
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(1)
                 << "X:" << world.x_mm << ",Y:" << world.y_mm << ",Z:" << world.z_mm;
 
             std::string message = oss.str();
+            const auto udp_send_start = std::chrono::high_resolution_clock::now();
             sendto(
                 udp_socket_,
                 message.c_str(),
@@ -156,11 +186,17 @@ void VisionProcessor::messageLoop() {
                 reinterpret_cast<sockaddr*>(&udp_target_addr_),
                 sizeof(udp_target_addr_)
             );
+            const auto udp_send_end = std::chrono::high_resolution_clock::now();
+            updateUdpSendStats(udp_send_start, udp_send_end);
             continue;
         }
 
         const char* stop_message = "CMD:STOP";
         while (running_) {
+            if (getSystemState() == SystemState::TRACKING) {
+                break;
+            }
+
             {
                 std::lock_guard<std::mutex> lock(world_mutex_);
                 if (has_new_robot_message_) {
@@ -172,6 +208,7 @@ void VisionProcessor::messageLoop() {
                 }
             }
 
+            const auto udp_send_start = std::chrono::high_resolution_clock::now();
             sendto(
                 udp_socket_,
                 stop_message,
@@ -180,6 +217,8 @@ void VisionProcessor::messageLoop() {
                 reinterpret_cast<sockaddr*>(&udp_target_addr_),
                 sizeof(udp_target_addr_)
             );
+            const auto udp_send_end = std::chrono::high_resolution_clock::now();
+            updateUdpSendStats(udp_send_start, udp_send_end);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -189,7 +228,7 @@ void VisionProcessor::messageLoop() {
 void VisionProcessor::watchdogLoop() {
     watchdog_socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (watchdog_socket_ == INVALID_SOCKET) {
-        std::cerr << "[Watchdog] Failed to create UDP receive socket." << std::endl;
+        Logger::LogCritical("Failed to create UDP receive socket");
         return;
     }
 
@@ -207,20 +246,14 @@ void VisionProcessor::watchdogLoop() {
     local_addr.sin_port = htons(static_cast<u_short>(watchdog_port_));
     inet_pton(AF_INET, "127.0.0.1", &local_addr.sin_addr);
 
-    if (bind(
-        watchdog_socket_,
-        reinterpret_cast<sockaddr*>(&local_addr),
-        sizeof(local_addr)
-    ) == SOCKET_ERROR) {
-        std::cerr << "[Watchdog] Failed to bind UDP receive port "
-                  << watchdog_port_ << ": " << WSAGetLastError() << std::endl;
+    if (bind(watchdog_socket_, reinterpret_cast<sockaddr*>(&local_addr), sizeof(local_addr)) == SOCKET_ERROR) {
+        Logger::LogCritical("Failed to bind UDP receive port " + std::to_string(watchdog_port_));
         closesocket(watchdog_socket_);
         watchdog_socket_ = INVALID_SOCKET;
         return;
     }
 
-    std::cout << "[Watchdog] Listening for heartbeat on 127.0.0.1:"
-              << watchdog_port_ << std::endl;
+    Logger::LogInfo("Listening for heartbeat on 127.0.0.1:" + std::to_string(watchdog_port_));
 
     char buffer[256];
     while (running_) {
@@ -242,7 +275,7 @@ void VisionProcessor::watchdogLoop() {
             }
 
             if (running_) {
-                std::cerr << "[Watchdog] recvfrom failed: " << error << std::endl;
+                Logger::LogWarn("recvfrom failed: " + std::to_string(error));
             }
             continue;
         }
@@ -261,6 +294,7 @@ void VisionProcessor::watchdogLoop() {
                 (system_state_ == SystemState::E_STOP && estop_reason_ == EStopReason::WATCHDOG_TIMEOUT)) {
                 system_state_ = SystemState::TRACKING;
                 estop_reason_ = EStopReason::NONE;
+                world_cv_.notify_one();
             }
         }
     }
@@ -268,6 +302,7 @@ void VisionProcessor::watchdogLoop() {
 
 void VisionProcessor::checkWatchdogTimeout() {
     bool timed_out = false;
+    long long age_ms = -1;
 
     {
         std::lock_guard<std::mutex> lock(watchdog_mutex_);
@@ -276,11 +311,9 @@ void VisionProcessor::checkWatchdogTimeout() {
         }
 
         auto now = std::chrono::steady_clock::now();
-        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_heartbeat_time_
-        ).count();
+        age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_heartbeat_time_).count();
 
-        if (elapsed_ms > watchdog_timeout_ms_) {
+        if (age_ms > watchdog_timeout_ms_) {
             system_state_ = SystemState::E_STOP;
             estop_reason_ = EStopReason::WATCHDOG_TIMEOUT;
             timed_out = true;
@@ -288,7 +321,10 @@ void VisionProcessor::checkWatchdogTimeout() {
     }
 
     if (timed_out) {
+        Logger::LogCritical("Heartbeat timeout");
         publishRobotMessage({ RobotState::TARGET_LOST, {} });
+    } else if (age_ms > watchdog_timeout_ms_ * 0.7) {
+        Logger::LogWarn("Heartbeat delay is rising: " + std::to_string(age_ms) + " ms");
     }
 }
 
@@ -318,9 +354,7 @@ long long VisionProcessor::getHeartbeatAgeMs() {
     }
 
     auto now = std::chrono::steady_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - last_heartbeat_time_
-    ).count();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now - last_heartbeat_time_).count();
 }
 
 const char* VisionProcessor::systemStateName(SystemState state) const {
@@ -337,24 +371,19 @@ const char* VisionProcessor::systemStateName(SystemState state) const {
 }
 
 void VisionProcessor::inferenceLoop() {
-    auto last_infer_time = std::chrono::steady_clock::now() -
-        std::chrono::milliseconds(infer_interval_ms_);
+    auto last_infer_time = std::chrono::steady_clock::now() - std::chrono::milliseconds(infer_interval_ms_);
 
     while (running_) {
         auto now = std::chrono::steady_clock::now();
-        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_infer_time
-        ).count();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_infer_time).count();
 
         if (elapsed_ms < infer_interval_ms_) {
-            // 还没到下一次推理时间，短暂休眠，避免空转吃满 CPU。
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
 
         cv::Mat frame_for_infer;
         {
-            // 加锁只做一件事：把最新画面 clone 出来，然后马上释放锁。
             std::lock_guard<std::mutex> lock(frame_mutex_);
             if (!latest_camera_frame_.empty()) {
                 frame_for_infer = latest_camera_frame_.clone();
@@ -362,57 +391,46 @@ void VisionProcessor::inferenceLoop() {
         }
 
         if (frame_for_infer.empty()) {
-            // 程序刚启动时，主线程可能还没来得及提供第一帧。
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
 
         last_infer_time = now;
 
-        // 模型预处理：Letterbox 到 640x640，BGR 转 RGB，
-        // 再转成 NCHW 格式的 float blob，并归一化到 0~1。
+        const auto inference_start = std::chrono::high_resolution_clock::now();
         cv::Mat letterbox_img = Letterbox(frame_for_infer, cv::Size(640, 640));
         cv::Mat model_input_rgb;
         cv::cvtColor(letterbox_img, model_input_rgb, cv::COLOR_BGR2RGB);
 
         cv::Mat blob;
-        cv::dnn::blobFromImage(
-            model_input_rgb,
-            blob,
-            1.0 / 255.0,
-            cv::Size(640, 640),
-            cv::Scalar(),
-            false,
-            false
-        );
+        cv::dnn::blobFromImage(model_input_rgb, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), false, false);
 
         InferenceResult result;
         if (model_.infer(blob, result)) {
+            const auto inference_end = std::chrono::high_resolution_clock::now();
+            updateInferenceStats(inference_start, inference_end);
             applyCenterFilter(result);
 
             if (result.contours.empty()) {
+                Logger::LogCritical("Target lost");
                 enterEStop(EStopReason::TARGET_LOST);
                 publishRobotMessage({ RobotState::TARGET_LOST, {} });
-            }
-            else {
+            } else {
                 cv::Point2f camera_pixel = modelPointToCameraPixel(result.center, frame_for_infer.size());
                 WorldPoint3D world = pixelToWorld3D(camera_pixel);
 
                 if (!isInsideSafeZone(world)) {
+                    Logger::LogCritical("Electronic fence breach");
                     enterEStop(EStopReason::OUT_OF_BOUNDS);
                     publishRobotMessage({ RobotState::OUT_OF_BOUNDS, world });
-                }
-                else {
+                } else {
                     publishRobotMessage({ RobotState::SAFE, world });
                 }
             }
-            
 
-            // 推理成功后，把最新结果发布给主线程显示。
             std::lock_guard<std::mutex> lock(result_mutex_);
             latest_result_ = std::move(result);
         }
-
     }
 }
 
@@ -432,26 +450,21 @@ void VisionProcessor::applyCenterFilter(InferenceResult& result) {
         filtered_center_ = raw_center;
         has_filtered_center_ = true;
     } else {
-        filtered_center_.x =
-            center_filter_alpha_ * raw_center.x +
-            (1.0f - center_filter_alpha_) * filtered_center_.x;
-
-        filtered_center_.y =
-            center_filter_alpha_ * raw_center.y +
-            (1.0f - center_filter_alpha_) * filtered_center_.y;
+        filtered_center_.x = center_filter_alpha_ * raw_center.x + (1.0f - center_filter_alpha_) * filtered_center_.x;
+        filtered_center_.y = center_filter_alpha_ * raw_center.y + (1.0f - center_filter_alpha_) * filtered_center_.y;
     }
 
     result.center = filtered_center_;
 
-    std::cout << "Raw Center: (" << raw_center.x << ", " << raw_center.y << ")"
-              << "  Filtered Center: (" << filtered_center_.x << ", " << filtered_center_.y << ")"
-              << std::endl;
+    if (coordinate_debug_enabled_) {
+        Logger::LogDebug(
+            "Raw Center: (" + std::to_string(raw_center.x) + ", " + std::to_string(raw_center.y) + ")" +
+            "  Filtered Center: (" + std::to_string(filtered_center_.x) + ", " + std::to_string(filtered_center_.y) + ")"
+        );
+    }
 }
 
-cv::Point2f VisionProcessor::modelPointToCameraPixel(
-    const cv::Point2f& model_point,
-    const cv::Size& camera_size
-) const {
+cv::Point2f VisionProcessor::modelPointToCameraPixel(const cv::Point2f& model_point, const cv::Size& camera_size) const {
     if (model_point.x < 0.0f || model_point.y < 0.0f || camera_size.width <= 0 || camera_size.height <= 0) {
         return cv::Point2f(-1.0f, -1.0f);
     }
@@ -465,19 +478,14 @@ cv::Point2f VisionProcessor::modelPointToCameraPixel(
     const float pad_x = (640.0f - resized_width) * 0.5f;
     const float pad_y = (640.0f - resized_height) * 0.5f;
 
-    return cv::Point2f(
-        (model_point.x - pad_x) / scale,
-        (model_point.y - pad_y) / scale
-    );
+    return cv::Point2f((model_point.x - pad_x) / scale, (model_point.y - pad_y) / scale);
 }
 
 VisionProcessor::WorldPoint3D VisionProcessor::pixelToWorld3D(const cv::Point2f& pixel_point) const {
     WorldPoint3D world;
     world.z_mm = mock_depth_mm_;
-    world.x_mm = (static_cast<double>(pixel_point.x) - camera_intrinsics_.cx) *
-        mock_depth_mm_ / camera_intrinsics_.fx;
-    world.y_mm = (static_cast<double>(pixel_point.y) - camera_intrinsics_.cy) *
-        mock_depth_mm_ / camera_intrinsics_.fy;
+    world.x_mm = (static_cast<double>(pixel_point.x) - camera_intrinsics_.cx) * mock_depth_mm_ / camera_intrinsics_.fx;
+    world.y_mm = (static_cast<double>(pixel_point.y) - camera_intrinsics_.cy) * mock_depth_mm_ / camera_intrinsics_.fy;
     return world;
 }
 
@@ -505,43 +513,7 @@ void VisionProcessor::setUdpTarget(SOCKET socket, const sockaddr_in& target_addr
     udp_enabled_ = true;
 }
 
-//void VisionProcessor::printWorldCoordinate(const cv::Point2f& model_center, const cv::Size& camera_size)  {
-//    cv::Point2f camera_pixel = modelPointToCameraPixel(model_center, camera_size);
-//    if (camera_pixel.x < 0.0f || camera_pixel.y < 0.0f) {
-//        return;
-//    }
-//
-//    WorldPoint3D world = pixelToWorld3D(camera_pixel);
-//
-//    std::cout << std::fixed << std::setprecision(2)
-//              << "World 3D X: " << world.x_mm << " mm, "
-//              << "Y: " << world.y_mm << " mm, "
-//              << "Z: " << world.z_mm << " mm"
-//              << std::defaultfloat << std::setprecision(6) << std::endl;
-//
-//    std::ostringstream oss;
-//    oss << std::fixed << std::setprecision(1)
-//        << "X:" << world.x_mm << ",Y:" << world.y_mm << ",Z:" << world.z_mm;
-//
-//    std::string message = oss.str();
-//
-//    if (!udp_enabled_ || udp_socket_ == INVALID_SOCKET) {
-//        return;
-//    }
-//
-//    sendto(
-//        udp_socket_,
-//        message.c_str(),
-//        static_cast<int>(message.size()),
-//        0,
-//        reinterpret_cast<sockaddr*>(&udp_target_addr_),
-//        sizeof(udp_target_addr_)
-//    );
-//}
-void VisionProcessor::printWorldCoordinate(
-    const cv::Point2f& model_center,
-    const cv::Size& camera_size
-) {
+void VisionProcessor::printWorldCoordinate(const cv::Point2f& model_center, const cv::Size& camera_size) {
     cv::Point2f camera_pixel = modelPointToCameraPixel(model_center, camera_size);
     if (camera_pixel.x < 0.0f || camera_pixel.y < 0.0f) {
         return;
@@ -599,6 +571,7 @@ void VisionProcessor::drawDashboard(cv::Mat& frame, SystemState state, long long
         return;
     }
 
+    PerformanceStats stats = getPerformanceStats();
     cv::Scalar state_color(0, 255, 255);
     if (state == SystemState::TRACKING) {
         state_color = cv::Scalar(0, 255, 0);
@@ -611,6 +584,19 @@ void VisionProcessor::drawDashboard(cv::Mat& frame, SystemState state, long long
     if (heartbeat_age_ms >= 0 && heartbeat_age_ms <= watchdog_timeout_ms_) {
         ping_text = "Ping: " + std::to_string(heartbeat_age_ms) + "ms";
     }
+
+    std::string fps_text = "FPS: --";
+    if (stats.fps > 0.0) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(1) << "FPS: " << stats.fps;
+        fps_text = oss.str();
+    }
+
+    std::ostringstream ai_oss;
+    ai_oss << std::fixed << std::setprecision(1) << "AI: " << stats.inference_ms << "ms";
+
+    std::ostringstream net_oss;
+    net_oss << std::fixed << std::setprecision(1) << "Net: " << stats.udp_send_ms << "ms";
 
     cv::putText(
         frame,
@@ -635,4 +621,98 @@ void VisionProcessor::drawDashboard(cv::Mat& frame, SystemState state, long long
         2,
         cv::LINE_AA
     );
+
+    cv::putText(
+        frame,
+        fps_text,
+        cv::Point(16, 96),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.7,
+        cv::Scalar(0, 255, 0),
+        2,
+        cv::LINE_AA
+    );
+
+    cv::putText(
+        frame,
+        ai_oss.str(),
+        cv::Point(16, 128),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.7,
+        cv::Scalar(0, 255, 255),
+        2,
+        cv::LINE_AA
+    );
+
+    cv::putText(
+        frame,
+        net_oss.str(),
+        cv::Point(16, 160),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.7,
+        cv::Scalar(0, 255, 255),
+        2,
+        cv::LINE_AA
+    );
+}
+
+void VisionProcessor::updateFrameStats(
+    const std::chrono::high_resolution_clock::time_point& frame_time,
+    const std::chrono::high_resolution_clock::time_point& camera_read_start,
+    const std::chrono::high_resolution_clock::time_point& camera_read_end) {
+    std::lock_guard<std::mutex> lock(performance_mutex_);
+    performance_stats_.camera_read_start = camera_read_start;
+    performance_stats_.camera_read_end = camera_read_end;
+    performance_stats_.camera_read_ms = std::chrono::duration<double, std::milli>(camera_read_end - camera_read_start).count();
+
+    if (performance_stats_.fps_window_start.time_since_epoch().count() == 0) {
+        performance_stats_.fps_window_start = frame_time;
+        performance_stats_.last_frame_time = frame_time;
+        performance_stats_.frames_in_window = 0;
+        performance_stats_.fps_sample_sum = 0.0;
+    }
+
+    ++performance_stats_.frames_in_window;
+    if (performance_stats_.last_frame_time.time_since_epoch().count() != 0) {
+        const double frame_interval_ms = std::chrono::duration<double, std::milli>(frame_time - performance_stats_.last_frame_time).count();
+        if (frame_interval_ms > 0.0) {
+            performance_stats_.fps_sample_sum += 1000.0 / frame_interval_ms;
+        }
+    }
+
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(frame_time - performance_stats_.fps_window_start).count();
+    if (performance_stats_.frames_in_window >= 10 || elapsed_ms >= 1000.0) {
+        const int sample_count = performance_stats_.frames_in_window;
+        if (sample_count > 0) {
+            performance_stats_.fps = performance_stats_.fps_sample_sum / static_cast<double>(sample_count);
+        }
+        performance_stats_.frames_in_window = 0;
+        performance_stats_.fps_sample_sum = 0.0;
+        performance_stats_.fps_window_start = frame_time;
+    }
+
+    performance_stats_.last_frame_time = frame_time;
+}
+
+void VisionProcessor::updateInferenceStats(
+    const std::chrono::high_resolution_clock::time_point& inference_start,
+    const std::chrono::high_resolution_clock::time_point& inference_end) {
+    std::lock_guard<std::mutex> lock(performance_mutex_);
+    performance_stats_.inference_start = inference_start;
+    performance_stats_.inference_end = inference_end;
+    performance_stats_.inference_ms = std::chrono::duration<double, std::milli>(inference_end - inference_start).count();
+}
+
+void VisionProcessor::updateUdpSendStats(
+    const std::chrono::high_resolution_clock::time_point& udp_send_start,
+    const std::chrono::high_resolution_clock::time_point& udp_send_end) {
+    std::lock_guard<std::mutex> lock(performance_mutex_);
+    performance_stats_.udp_send_start = udp_send_start;
+    performance_stats_.udp_send_end = udp_send_end;
+    performance_stats_.udp_send_ms = std::chrono::duration<double, std::milli>(udp_send_end - udp_send_start).count();
+}
+
+VisionProcessor::PerformanceStats VisionProcessor::getPerformanceStats() const {
+    std::lock_guard<std::mutex> lock(performance_mutex_);
+    return performance_stats_;
 }

@@ -1,9 +1,10 @@
 #include "OnnxModel.h"
 
+#include "Logger.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <iostream>
 #include <utility>
 
 namespace {
@@ -31,15 +32,15 @@ bool shouldLogNow() {
     return true;
 }
 
-void printShape(const std::string& name, const std::vector<int64_t>& shape) {
-    std::cout << name << " shape: ";
+void logShape(const std::string& name, const std::vector<int64_t>& shape) {
+    std::string message = name + " shape: ";
     for (size_t i = 0; i < shape.size(); ++i) {
-        std::cout << shape[i];
+        message += std::to_string(shape[i]);
         if (i + 1 < shape.size()) {
-            std::cout << "x";
+            message += "x";
         }
     }
-    std::cout << std::endl;
+    Logger::LogDebug(message);
 }
 }
 
@@ -55,27 +56,18 @@ bool OnnxModel::load(const std::string& model_path) {
     try {
 #ifdef _WIN32
         std::wstring wide_model_path(model_path.begin(), model_path.end());
-        session_ = std::make_unique<Ort::Session>(
-            env_,
-            wide_model_path.c_str(),
-            session_options_
-        );
+        session_ = std::make_unique<Ort::Session>(env_, wide_model_path.c_str(), session_options_);
 #else
-        session_ = std::make_unique<Ort::Session>(
-            env_,
-            model_path.c_str(),
-            session_options_
-        );
+        session_ = std::make_unique<Ort::Session>(env_, model_path.c_str(), session_options_);
 #endif
         if (!prepareNames()) {
             return false;
         }
 
-        std::cout << "[Info] ONNX model loaded: " << model_path << std::endl;
+        Logger::LogInfo("ONNX model loaded: " + model_path);
         return true;
-    }
-    catch (const Ort::Exception& e) {
-        std::cerr << "[Error] Failed to load ONNX model: " << e.what() << std::endl;
+    } catch (const Ort::Exception& e) {
+        Logger::LogCritical(std::string("Failed to load ONNX model: ") + e.what());
         return false;
     }
 }
@@ -118,18 +110,18 @@ bool OnnxModel::isLoaded() const {
 
 void OnnxModel::printModelInfo() const {
     if (!session_) {
-        std::cerr << "[Error] Model is not loaded." << std::endl;
+        Logger::LogCritical("Model is not loaded");
         return;
     }
 
-    std::cout << "Input count: " << input_name_strings_.size() << std::endl;
+    Logger::LogInfo("Input count: " + std::to_string(input_name_strings_.size()));
     for (const auto& name : input_name_strings_) {
-        std::cout << "Input Name: " << name << std::endl;
+        Logger::LogDebug("Input Name: " + name);
     }
 
-    std::cout << "Output count: " << output_name_strings_.size() << std::endl;
+    Logger::LogInfo("Output count: " + std::to_string(output_name_strings_.size()));
     for (const auto& name : output_name_strings_) {
-        std::cout << "Output Name: " << name << std::endl;
+        Logger::LogDebug("Output Name: " + name);
     }
 }
 
@@ -137,12 +129,12 @@ bool OnnxModel::infer(const cv::Mat& blob, InferenceResult& result) {
     result = InferenceResult{};
 
     if (!session_) {
-        std::cerr << "[Error] Model is not loaded." << std::endl;
+        Logger::LogCritical("Model is not loaded");
         return false;
     }
 
     if (blob.empty() || blob.dims != 4 || blob.type() != CV_32F) {
-        std::cerr << "[Error] Invalid input blob. Expected CV_32F blob with shape 1x3x640x640." << std::endl;
+        Logger::LogCritical("Invalid input blob. Expected CV_32F blob with shape 1x3x640x640.");
         return false;
     }
 
@@ -152,11 +144,7 @@ bool OnnxModel::infer(const cv::Mat& blob, InferenceResult& result) {
     }
 
     cv::Mat continuous_blob = blob.isContinuous() ? blob : blob.clone();
-    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(
-        OrtArenaAllocator,
-        OrtMemTypeDefault
-    );
-
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
         memory_info,
         reinterpret_cast<float*>(continuous_blob.data),
@@ -182,7 +170,7 @@ bool OnnxModel::infer(const cv::Mat& blob, InferenceResult& result) {
         result.inference_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
         if (outputs.size() < 2) {
-            std::cerr << "[Error] Expected YOLO-seg outputs: output0 and output1." << std::endl;
+            Logger::LogCritical("Expected YOLO-seg outputs: output0 and output1");
             return false;
         }
 
@@ -192,7 +180,7 @@ bool OnnxModel::infer(const cv::Mat& blob, InferenceResult& result) {
                 std::string name = i < output_name_strings_.size()
                     ? "Output " + std::to_string(i) + " (" + output_name_strings_[i] + ")"
                     : "Output " + std::to_string(i);
-                printShape(name, shape);
+                logShape(name, shape);
             }
         }
 
@@ -234,7 +222,6 @@ bool OnnxModel::infer(const cv::Mat& blob, InferenceResult& result) {
 
             cv::Rect box(left, top, width, height);
             box &= cv::Rect(0, 0, kInputSize, kInputSize);
-
             if (box.area() <= 0) {
                 continue;
             }
@@ -275,11 +262,9 @@ bool OnnxModel::infer(const cv::Mat& blob, InferenceResult& result) {
                 for (int x = 0; x < kProtoW; ++x) {
                     int pixel_index = y * kProtoW + x;
                     float value = 0.0f;
-
                     for (int c = 0; c < kMaskChannels; ++c) {
                         value += detection.mask_coeffs[c] * proto_data[c * proto_plane_size + pixel_index];
                     }
-
                     mask_row[x] = sigmoid(value);
                 }
             }
@@ -296,24 +281,13 @@ bool OnnxModel::infer(const cv::Mat& blob, InferenceResult& result) {
             cv::Mat contour_mask;
             result.mask.convertTo(contour_mask, CV_8U, 255.0);
 
-            // 1) 闭运算：先把主区域内部的小洞尽量补上
             cv::Mat closed_mask;
-            cv::Mat kernel = cv::getStructuringElement(
-                cv::MORPH_ELLIPSE,
-                cv::Size(5, 5)
-            );
+            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
             cv::morphologyEx(contour_mask, closed_mask, cv::MORPH_CLOSE, kernel);
 
-            // 2) 提取外轮廓
             result.contours.clear();
-            cv::findContours(
-                closed_mask,
-                result.contours,
-                cv::RETR_EXTERNAL,
-                cv::CHAIN_APPROX_SIMPLE
-            );
+            cv::findContours(closed_mask, result.contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-            // 3) 只保留面积最大的核心轮廓
             int best_index = -1;
             double best_area = 0.0;
             for (int i = 0; i < static_cast<int>(result.contours.size()); ++i) {
@@ -326,17 +300,9 @@ bool OnnxModel::infer(const cv::Mat& blob, InferenceResult& result) {
 
             cv::Mat solid_mask = cv::Mat::zeros(closed_mask.size(), CV_8U);
             if (best_index >= 0 && best_area > 100.0) {
-                cv::drawContours(
-                    solid_mask,
-                    result.contours,
-                    best_index,
-                    cv::Scalar(255),
-                    cv::FILLED
-                );
-
+                cv::drawContours(solid_mask, result.contours, best_index, cv::Scalar(255), cv::FILLED);
                 result.contours = { result.contours[best_index] };
 
-                // 4) 用最大轮廓的实心区域计算 moments，得到中心点
                 cv::Moments m = cv::moments(solid_mask, true);
                 if (m.m00 > 0.0) {
                     result.raw_center = cv::Point2f(
@@ -351,23 +317,22 @@ bool OnnxModel::infer(const cv::Mat& blob, InferenceResult& result) {
         result.valid = true;
 
         if (log_this_run) {
-            std::cout << "Mask coefficients count: " << kMaskChannels << std::endl;
-            std::cout << "Proto shape: 1x" << kMaskChannels << "x" << kProtoH << "x" << kProtoW << std::endl;
-            std::cout << "Detections before NMS: " << boxes.size() << std::endl;
-            std::cout << "Detections after NMS: " << result.detections.size() << std::endl;
-            std::cout << "Contours: " << result.contours.size() << std::endl;
+            Logger::LogDebug("Mask coefficients count: " + std::to_string(kMaskChannels));
+            Logger::LogDebug("Proto shape: 1x" + std::to_string(kMaskChannels) + "x" + std::to_string(kProtoH) + "x" + std::to_string(kProtoW));
+            Logger::LogDebug("Detections before NMS: " + std::to_string(boxes.size()));
+            Logger::LogDebug("Detections after NMS: " + std::to_string(result.detections.size()));
+            Logger::LogDebug("Contours: " + std::to_string(result.contours.size()));
             if (result.raw_center.x >= 0.0f && result.raw_center.y >= 0.0f) {
-                std::cout << "Raw Center: (" << result.raw_center.x << ", " << result.raw_center.y << ")" << std::endl;
+                Logger::LogDebug("Raw Center: (" + std::to_string(result.raw_center.x) + ", " + std::to_string(result.raw_center.y) + ")");
             } else {
-                std::cout << "Center: target not found" << std::endl;
+                Logger::LogDebug("Center: target not found");
             }
-            std::cout << "Inference Time: " << result.inference_ms << " ms" << std::endl;
+            Logger::LogDebug("Inference Time: " + std::to_string(result.inference_ms) + " ms");
         }
 
         return true;
-    }
-    catch (const Ort::Exception& e) {
-        std::cerr << "[Error] ONNX inference failed: " << e.what() << std::endl;
+    } catch (const Ort::Exception& e) {
+        Logger::LogCritical(std::string("ONNX inference failed: ") + e.what());
         return false;
     }
 }
@@ -401,22 +366,9 @@ void OnnxModel::drawResult(cv::Mat& image, const InferenceResult& result) const 
             static_cast<int>(std::round(result.raw_center.x)),
             static_cast<int>(std::round(result.raw_center.y))
         );
-
         cv::circle(image, raw_center_point, 4, cv::Scalar(0, 0, 255), cv::FILLED);
-        cv::line(
-            image,
-            cv::Point(raw_center_point.x - 10, raw_center_point.y),
-            cv::Point(raw_center_point.x + 10, raw_center_point.y),
-            cv::Scalar(0, 0, 255),
-            2
-        );
-        cv::line(
-            image,
-            cv::Point(raw_center_point.x, raw_center_point.y - 10),
-            cv::Point(raw_center_point.x, raw_center_point.y + 10),
-            cv::Scalar(0, 0, 255),
-            2
-        );
+        cv::line(image, cv::Point(raw_center_point.x - 10, raw_center_point.y), cv::Point(raw_center_point.x + 10, raw_center_point.y), cv::Scalar(0, 0, 255), 2);
+        cv::line(image, cv::Point(raw_center_point.x, raw_center_point.y - 10), cv::Point(raw_center_point.x, raw_center_point.y + 10), cv::Scalar(0, 0, 255), 2);
     }
 
     if (result.center.x >= 0.0f && result.center.y >= 0.0f) {
@@ -424,39 +376,16 @@ void OnnxModel::drawResult(cv::Mat& image, const InferenceResult& result) const 
             static_cast<int>(std::round(result.center.x)),
             static_cast<int>(std::round(result.center.y))
         );
-
         cv::circle(image, center_point, 5, cv::Scalar(0, 255, 0), cv::FILLED);
-        cv::line(
-            image,
-            cv::Point(center_point.x - 12, center_point.y),
-            cv::Point(center_point.x + 12, center_point.y),
-            cv::Scalar(0, 255, 0),
-            2
-        );
-        cv::line(
-            image,
-            cv::Point(center_point.x, center_point.y - 12),
-            cv::Point(center_point.x, center_point.y + 12),
-            cv::Scalar(0, 255, 0),
-            2
-        );
+        cv::line(image, cv::Point(center_point.x - 12, center_point.y), cv::Point(center_point.x + 12, center_point.y), cv::Scalar(0, 255, 0), 2);
+        cv::line(image, cv::Point(center_point.x, center_point.y - 12), cv::Point(center_point.x, center_point.y + 12), cv::Scalar(0, 255, 0), 2);
     }
 
     for (const Detection& detection : result.detections) {
         cv::rectangle(image, detection.box, cv::Scalar(0, 255, 0), 2);
-
-        std::string label = "class " + std::to_string(detection.class_id) + " " +
-            std::to_string(detection.score).substr(0, 4);
+        std::string label = "class " + std::to_string(detection.class_id) + " " + std::to_string(detection.score).substr(0, 4);
         int label_top = std::max(detection.box.y - 5, 15);
-        cv::putText(
-            image,
-            label,
-            cv::Point(detection.box.x, label_top),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.5,
-            cv::Scalar(0, 255, 0),
-            2
-        );
+        cv::putText(image, label, cv::Point(detection.box.x, label_top), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
     }
 }
 

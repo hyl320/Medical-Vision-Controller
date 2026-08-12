@@ -1,59 +1,62 @@
-#include "VisionProcessor.h"
+#include "MainWindow.h"
+#include "Logger.h"
+#include "VisionWorker.h"
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <opencv2/opencv.hpp>
+#include <QApplication>
+#include <QThread>
 
-#ifndef MODEL_PATH
-#define MODEL_PATH "models/best.onnx"
-#endif
+#include <string_view>
 
-int main() {
-    WSADATA wsaData;
-    int wsa_result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-
-    if (wsa_result != 0) {
-        return -1;
-    }
-
-    SOCKET udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP); //创建一个udp发送工具
-
-    if (udp_socket == INVALID_SOCKET) {
-        WSACleanup();
-        return -1;
-    }
-
-    sockaddr_in target_addr{};
-    target_addr.sin_family = AF_INET;
-    target_addr.sin_port = htons(8888);
-    inet_pton(AF_INET, "127.0.0.1", &target_addr.sin_addr);
-
-    VisionProcessor processor;
-
-    processor.setUdpTarget(udp_socket, target_addr);
-
-    // Day 7 之后，main 只负责启动系统和显示画面。
-    // 模型加载、摄像头、后台推理线程都被封装进 VisionProcessor。
-    if (!processor.init(MODEL_PATH, 0, 300)) {
-        return -1;
-    }
-
-    while (true) {
-        cv::Mat output_frame;
-        if (processor.processFrame(output_frame)) {
-            cv::imshow("Vision System Output", output_frame);
-        }
-
-        // 按 ESC 退出程序。
-        if (cv::waitKey(1) == 27) {
-            break;
+namespace {
+bool hasHeadlessFlag(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--headless") {
+            return true;
         }
     }
-    
-    processor.stop();
-    cv::destroyAllWindows();
+    return false;
+}
+}  // namespace
 
-    closesocket(udp_socket);
-    WSACleanup();
-    return 0;
+int main(int argc, char* argv[]) {
+    const bool headless = hasHeadlessFlag(argc, argv);
+
+    if (headless) {
+        Logger::LogInfo("System started in HEADLESS mode.");
+
+        QThread worker_thread;
+        VisionWorker worker;
+        worker.moveToThread(&worker_thread);
+
+        QObject::connect(&worker_thread, &QThread::started, &worker, &VisionWorker::start);
+        QObject::connect(&worker, &VisionWorker::finished, &worker_thread, &QThread::quit);
+
+        worker_thread.start();
+        return worker_thread.wait() ? 0 : 1;
+    }
+
+    QApplication app(argc, argv);
+
+    MainWindow window;
+    window.show();
+
+    auto* worker_thread = new QThread(&app);
+    auto* worker = new VisionWorker();
+    worker->moveToThread(worker_thread);
+
+    QObject::connect(worker_thread, &QThread::started, worker, &VisionWorker::start);
+    QObject::connect(worker, &VisionWorker::frameReady, &window, &MainWindow::displayFrame);
+    QObject::connect(worker, &VisionWorker::finished, worker_thread, &QThread::quit);
+    QObject::connect(worker, &VisionWorker::finished, worker, &VisionWorker::deleteLater);
+    QObject::connect(worker_thread, &QThread::finished, worker_thread, &QThread::deleteLater);
+    QObject::connect(&app, &QApplication::aboutToQuit, worker, &VisionWorker::stop, Qt::DirectConnection);
+
+    worker_thread->start();
+
+    const int exit_code = app.exec();
+    worker->stop();
+    worker_thread->quit();
+    worker_thread->wait();
+
+    return exit_code;
 }

@@ -1,24 +1,24 @@
 #include "VisionSensor.h"
 
-#include <iostream>
+#include "Logger.h"
 
 VisionSensor::VisionSensor() = default;
 
 VisionSensor::~VisionSensor() {
     if (cap_.isOpened()) {
         cap_.release();
-        std::cout << "[Info] 摄像头资源已释放。" << std::endl;
+        Logger::LogInfo("Camera resource released");
     }
 }
 
 bool VisionSensor::initialize(int camera_id) {
     cap_.open(camera_id);
     if (!cap_.isOpened()) {
-        std::cerr << "[Error] 无法连接摄像头。" << std::endl;
+        Logger::LogCritical("Failed to connect camera");
         return false;
     }
 
-    std::cout << "[Info] 摄像头初始化成功。" << std::endl;
+    Logger::LogInfo("Camera initialized successfully");
     return true;
 }
 
@@ -29,7 +29,7 @@ bool VisionSensor::getNextFrame(cv::Mat& frame) {
 
     cap_ >> frame;
     if (frame.empty()) {
-        std::cerr << "[Warning] 捕获到空帧。" << std::endl;
+        Logger::LogWarn("Captured empty frame");
         return false;
     }
 

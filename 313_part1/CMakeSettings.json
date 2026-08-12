@@ -20,6 +20,11 @@
           "name": "ONNXRUNTIME_DIR",
           "value": "D:/onnxruntime-win-x64-1.26.0/onnxruntime-win-x64-1.26.0",
           "type": "PATH"
+        },
+        {
+          "name": "CMAKE_PREFIX_PATH",
+          "value": "D:\\qt5\\6.8.0\\msvc2022_64",
+          "type": "PATH"
         }
       ]
     }

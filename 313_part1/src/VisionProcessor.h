@@ -40,6 +40,8 @@ public:
     bool init(const std::string& model_path, int camera_id = 0, int infer_interval_ms = 300);
     bool processFrame(cv::Mat& output_frame);
     void setUdpTarget(SOCKET socket, const sockaddr_in& target_addr);
+    void setCoordinateDebugEnabled(bool enabled);
+    bool isCoordinateDebugEnabled() const;
     void stop();
 
 private:
@@ -74,6 +76,23 @@ private:
         double max_y_mm = 150.0;
     };
 
+    struct PerformanceStats {
+        double fps = 0.0;
+        double camera_read_ms = 0.0;
+        double inference_ms = 0.0;
+        double udp_send_ms = 0.0;
+        int frames_in_window = 0;
+        double fps_sample_sum = 0.0;
+        std::chrono::high_resolution_clock::time_point fps_window_start{};
+        std::chrono::high_resolution_clock::time_point last_frame_time{};
+        std::chrono::high_resolution_clock::time_point camera_read_start{};
+        std::chrono::high_resolution_clock::time_point camera_read_end{};
+        std::chrono::high_resolution_clock::time_point inference_start{};
+        std::chrono::high_resolution_clock::time_point inference_end{};
+        std::chrono::high_resolution_clock::time_point udp_send_start{};
+        std::chrono::high_resolution_clock::time_point udp_send_end{};
+    };
+
     void publishRobotMessage(const RobotMessage& message);
     RobotMessage getLatestRobotMessage();
     void publishWorldCoordinate(const WorldPoint3D& world);
@@ -95,6 +114,17 @@ private:
     void drawUiOverlay(cv::Mat& frame, const RobotMessage& message, SystemState state) const;
     void drawDashboard(cv::Mat& frame, SystemState state, long long heartbeat_age_ms) const;
     void printWorldCoordinate(const cv::Point2f& model_center, const cv::Size& camera_size);
+    void updateFrameStats(
+        const std::chrono::high_resolution_clock::time_point& frame_time,
+        const std::chrono::high_resolution_clock::time_point& camera_read_start,
+        const std::chrono::high_resolution_clock::time_point& camera_read_end);
+    void updateInferenceStats(
+        const std::chrono::high_resolution_clock::time_point& inference_start,
+        const std::chrono::high_resolution_clock::time_point& inference_end);
+    void updateUdpSendStats(
+        const std::chrono::high_resolution_clock::time_point& udp_send_start,
+        const std::chrono::high_resolution_clock::time_point& udp_send_end);
+    PerformanceStats getPerformanceStats() const;
 
     VisionSensor sensor_;
     OnnxModel model_;
@@ -114,6 +144,7 @@ private:
     std::mutex result_mutex_;
     std::mutex world_mutex_;
     std::mutex watchdog_mutex_;
+    mutable std::mutex performance_mutex_;
     std::condition_variable world_cv_;
 
     cv::Mat latest_camera_frame_;
@@ -122,19 +153,22 @@ private:
     RobotMessage latest_robot_message_;
     bool has_new_robot_message_ = false;
 
-    const float center_filter_alpha_ = 0.25f;
+    float center_filter_alpha_ = 0.25f;
     bool has_filtered_center_ = false;
     cv::Point2f filtered_center_{ -1.0f, -1.0f };
 
-    const CameraIntrinsics camera_intrinsics_{};
+    CameraIntrinsics camera_intrinsics_{};
     const double mock_depth_mm_ = 500.0;
-    const SafeZone safe_zone_{};
+    SafeZone safe_zone_{};
     SystemState system_state_ = SystemState::STANDBY;
     EStopReason estop_reason_ = EStopReason::NONE;
     SOCKET watchdog_socket_ = INVALID_SOCKET;
     std::chrono::steady_clock::time_point last_heartbeat_time_{};
     bool has_heartbeat_ = false;
+    PerformanceStats performance_stats_{};
     const int watchdog_port_ = 9999;
     const int watchdog_recv_timeout_ms_ = 200;
-    const int watchdog_timeout_ms_ = 500;
+    int watchdog_timeout_ms_ = 500;
+    std::atomic<bool> coordinate_debug_enabled_{ true };
+    std::chrono::steady_clock::time_point last_heartbeat_warn_log_{};
 };
