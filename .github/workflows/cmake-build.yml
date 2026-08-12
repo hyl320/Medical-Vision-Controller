@@ -19,6 +19,8 @@ jobs:
 
     env:
       BUILD_DIR: build/ci
+      OPENCV_VERSION: 4.10.0
+      OPENCV_DIR: ${{ github.workspace }}/313_part1/third_party/opencv/build
       ONNXRUNTIME_VERSION: 1.18.1
       ONNXRUNTIME_DIR: ${{ github.workspace }}/313_part1/third_party/onnxruntime-win-x64-1.18.1
 
@@ -28,7 +30,24 @@ jobs:
 
       - name: Install build tools
         run: |
-          choco install ninja opencv --yes
+          choco install ninja --yes
+
+      - name: Cache OpenCV
+        uses: actions/cache@v4
+        with:
+          path: 313_part1/third_party/opencv
+          key: opencv-windows-${{ env.OPENCV_VERSION }}
+
+      - name: Download OpenCV
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "third_party/opencv/build/OpenCVConfig.cmake")) {
+            New-Item -ItemType Directory -Force -Path third_party | Out-Null
+            $installer = "opencv-${env:OPENCV_VERSION}-windows.exe"
+            $url = "https://github.com/opencv/opencv/releases/download/${env:OPENCV_VERSION}/$installer"
+            curl.exe -L --retry 5 --retry-delay 10 --output "third_party/$installer" $url
+            Start-Process -FilePath "third_party/$installer" -ArgumentList "-o`"$PWD/third_party`" -y" -Wait -NoNewWindow
+          }
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
@@ -39,14 +58,22 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
+      - name: Cache ONNX Runtime
+        uses: actions/cache@v4
+        with:
+          path: 313_part1/third_party/onnxruntime-win-x64-1.18.1
+          key: onnxruntime-windows-${{ env.ONNXRUNTIME_VERSION }}
+
       - name: Download ONNX Runtime
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path third_party | Out-Null
-          $archive = "onnxruntime-win-x64-${env:ONNXRUNTIME_VERSION}.zip"
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v${env:ONNXRUNTIME_VERSION}/$archive"
-          Invoke-WebRequest -Uri $url -OutFile "third_party/$archive"
-          Expand-Archive -Path "third_party/$archive" -DestinationPath third_party -Force
+          if (-not (Test-Path "${env:ONNXRUNTIME_DIR}/include/onnxruntime_cxx_api.h")) {
+            New-Item -ItemType Directory -Force -Path third_party | Out-Null
+            $archive = "onnxruntime-win-x64-${env:ONNXRUNTIME_VERSION}.zip"
+            $url = "https://github.com/microsoft/onnxruntime/releases/download/v${env:ONNXRUNTIME_VERSION}/$archive"
+            curl.exe -L --retry 5 --retry-delay 10 --output "third_party/$archive" $url
+            Expand-Archive -Path "third_party/$archive" -DestinationPath third_party -Force
+          }
 
       - name: Enable MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -62,7 +89,7 @@ jobs:
           -D CMAKE_BUILD_TYPE=Release
           -D CMAKE_C_COMPILER=cl
           -D CMAKE_CXX_COMPILER=cl
-          -D OpenCV_DIR="C:/tools/opencv/build"
+          -D OpenCV_DIR="${{ env.OPENCV_DIR }}"
           -D ONNXRUNTIME_DIR="${{ env.ONNXRUNTIME_DIR }}"
 
       - name: Build
