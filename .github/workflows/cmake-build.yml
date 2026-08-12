@@ -1,0 +1,72 @@
+name: CMake Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-windows:
+    name: Build VisionApp on Windows
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        working-directory: 313_part1
+
+    env:
+      BUILD_DIR: build/ci
+      ONNXRUNTIME_VERSION: 1.18.1
+      ONNXRUNTIME_DIR: ${{ github.workspace }}/313_part1/third_party/onnxruntime-win-x64-1.18.1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          choco install ninja opencv --yes
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.0"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Download ONNX Runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path third_party | Out-Null
+          $archive = "onnxruntime-win-x64-${env:ONNXRUNTIME_VERSION}.zip"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v${env:ONNXRUNTIME_VERSION}/$archive"
+          Invoke-WebRequest -Uri $url -OutFile "third_party/$archive"
+          Expand-Archive -Path "third_party/$archive" -DestinationPath third_party -Force
+
+      - name: Configure CMake
+        run: >
+          cmake
+          -S .
+          -B ${{ env.BUILD_DIR }}
+          -G Ninja
+          -D CMAKE_BUILD_TYPE=Release
+          -D OpenCV_DIR="C:/tools/opencv/build"
+          -D ONNXRUNTIME_DIR="${{ env.ONNXRUNTIME_DIR }}"
+
+      - name: Build
+        run: cmake --build ${{ env.BUILD_DIR }} --config Release
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VisionApp-windows
+          path: |
+            313_part1/${{ env.BUILD_DIR }}/VisionApp.exe
+            313_part1/${{ env.BUILD_DIR }}/*.dll
+            313_part1/config.json
+          if-no-files-found: error
