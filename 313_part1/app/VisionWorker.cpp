@@ -7,11 +7,27 @@
 #include <QDebug>
 #include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
 #include <string>
+
+namespace {
+QString systemStateText(SystemState state) {
+    switch (state) {
+    case SystemState::STANDBY:
+        return QStringLiteral("STANDBY");
+    case SystemState::TRACKING:
+        return QStringLiteral("TRACKING");
+    case SystemState::E_STOP:
+        return QStringLiteral("E-STOP");
+    default:
+        return QStringLiteral("UNKNOWN");
+    }
+}
+}
 
 VisionWorker::VisionWorker(QObject* parent)
     : QObject(parent) {
@@ -69,7 +85,7 @@ void VisionWorker::start() {
     const QString model_path = QDir(app_dir).filePath("models/best.onnx");
 
     ConfigManager::instance().load(config_path.toStdString());
-    const AppConfig& config = ConfigManager::instance().config();
+    const AppConfig config = ConfigManager::instance().snapshot();
 
     WSADATA wsaData;
     int wsa_result = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -100,16 +116,29 @@ void VisionWorker::start() {
     }
 
     running_ = true;
+    QElapsedTimer telemetry_timer;
+    telemetry_timer.start();
 
     while (running_) {
         cv::Mat output_frame;
-        if (!processor_.processFrame(output_frame)) {
-            continue;
+        if (processor_.processFrame(output_frame)) {
+            QImage image = matToQImage(output_frame);
+            if (!image.isNull()) {
+                emit frameReady(image);
+            }
         }
 
-        QImage image = matToQImage(output_frame);
-        if (!image.isNull()) {
-            emit frameReady(image);
+        if (telemetry_timer.elapsed() >= 100) {
+            const VisionTelemetry telemetry = processor_.getTelemetrySnapshot();
+            emit telemetryReady(
+                telemetry.x_mm,
+                telemetry.y_mm,
+                telemetry.z_mm,
+                telemetry.coordinate_valid,
+                telemetry.network_online,
+                static_cast<qint64>(telemetry.heartbeat_age_ms),
+                systemStateText(telemetry.system_state));
+            telemetry_timer.restart();
         }
     }
 
@@ -121,4 +150,19 @@ void VisionWorker::start() {
 
 void VisionWorker::stop() {
     running_ = false;
+}
+
+void VisionWorker::emergencyStop() {
+    processor_.triggerEmergencyStop();
+}
+
+void VisionWorker::updateRuntimeTuning(
+    double filter_alpha,
+    double half_width_mm,
+    double half_height_mm) {
+    processor_.updateRuntimeTuning(filter_alpha, half_width_mm, half_height_mm);
+}
+
+void VisionWorker::saveConfig() {
+    emit configSaved(ConfigManager::instance().save());
 }

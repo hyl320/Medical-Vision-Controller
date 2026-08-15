@@ -24,6 +24,8 @@ ConfigManager& ConfigManager::instance() {
 }
 
 bool ConfigManager::load(const std::string& config_path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    config_path_ = config_path;
     config_ = AppConfig{};
 
     std::ifstream file(config_path);
@@ -68,6 +70,63 @@ bool ConfigManager::load(const std::string& config_path) {
         Logger::LogWarn(std::string("配置文件加载失败，使用默认参数: ") + e.what());
         return false;
     }
+}
+
+bool ConfigManager::save() const {
+    nlohmann::json root;
+    std::string config_path;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        config_path = config_path_;
+        root["Network"] = {
+            { "target_ip", config_.network.target_ip },
+            { "udp_port", config_.network.udp_port }
+        };
+        root["Camera"] = {
+            { "fx", config_.camera.fx },
+            { "fy", config_.camera.fy },
+            { "cx", config_.camera.cx },
+            { "cy", config_.camera.cy }
+        };
+        root["Control"] = {
+            { "filter_alpha", config_.control.filter_alpha },
+            { "heartbeat_timeout_ms", config_.control.heartbeat_timeout_ms }
+        };
+        root["Safety"] = {
+            { "min_x_mm", config_.safety.min_x_mm },
+            { "max_x_mm", config_.safety.max_x_mm },
+            { "min_y_mm", config_.safety.min_y_mm },
+            { "max_y_mm", config_.safety.max_y_mm }
+        };
+    }
+
+    std::ofstream file(config_path);
+    if (!file.is_open()) {
+        Logger::LogWarn("Failed to save config: " + config_path);
+        return false;
+    }
+
+    file << root.dump(2);
+    Logger::LogInfo("Config saved: " + config_path);
+    return true;
+}
+
+AppConfig ConfigManager::snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return config_;
+}
+
+void ConfigManager::updateRuntimeTuning(
+    double filter_alpha,
+    double half_width_mm,
+    double half_height_mm) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    config_.control.filter_alpha = filter_alpha;
+    config_.safety.min_x_mm = -half_width_mm;
+    config_.safety.max_x_mm = half_width_mm;
+    config_.safety.min_y_mm = -half_height_mm;
+    config_.safety.max_y_mm = half_height_mm;
 }
 
 const AppConfig& ConfigManager::config() const {

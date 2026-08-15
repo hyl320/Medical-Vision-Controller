@@ -29,7 +29,18 @@ enum class EStopReason {
     NONE,
     WATCHDOG_TIMEOUT,
     TARGET_LOST,
-    OUT_OF_BOUNDS
+    OUT_OF_BOUNDS,
+    MANUAL_TRIGGER
+};
+
+struct VisionTelemetry {
+    double x_mm = 0.0;
+    double y_mm = 0.0;
+    double z_mm = 0.0;
+    bool coordinate_valid = false;
+    bool network_online = false;
+    long long heartbeat_age_ms = -1;
+    SystemState system_state = SystemState::STANDBY;
 };
 
 class VisionProcessor {
@@ -42,6 +53,9 @@ public:
     void setUdpTarget(SOCKET socket, const sockaddr_in& target_addr);
     void setCoordinateDebugEnabled(bool enabled);
     bool isCoordinateDebugEnabled() const;
+    void updateRuntimeTuning(double filter_alpha, double half_width_mm, double half_height_mm);
+    VisionTelemetry getTelemetrySnapshot();
+    void triggerEmergencyStop();
     void stop();
 
 private:
@@ -96,6 +110,7 @@ private:
     void publishRobotMessage(const RobotMessage& message);
     RobotMessage getLatestRobotMessage();
     void publishWorldCoordinate(const WorldPoint3D& world);
+    void sendStopCommandLocked();
     void messageLoop();
     void watchdogLoop();
     void checkWatchdogTimeout();
@@ -134,8 +149,10 @@ private:
     SOCKET udp_socket_ = INVALID_SOCKET;
     sockaddr_in udp_target_addr_{};
     bool udp_enabled_ = false;
+    std::mutex udp_send_mutex_;
 
     std::atomic<bool> running_{ false };
+    std::atomic<bool> manual_estop_latched_{ false };
     std::thread inference_thread_;
     std::thread message_thread_;
     std::thread watchdog_thread_;
@@ -145,6 +162,7 @@ private:
     std::mutex world_mutex_;
     std::mutex watchdog_mutex_;
     mutable std::mutex performance_mutex_;
+    mutable std::mutex runtime_config_mutex_;
     std::condition_variable world_cv_;
 
     cv::Mat latest_camera_frame_;

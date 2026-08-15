@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <string>
 
 struct NetworkConfig {
@@ -38,6 +39,9 @@ public:
     static ConfigManager& instance();
 
     bool load(const std::string& config_path = "config.json");
+    bool save() const;
+    AppConfig snapshot() const;
+    void updateRuntimeTuning(double filter_alpha, double half_width_mm, double half_height_mm);
     const AppConfig& config() const;
     const NetworkConfig& network() const;
     const CameraConfig& camera() const;
@@ -48,4 +52,6 @@ private:
     ConfigManager() = default;
 
     AppConfig config_{};
+    std::string config_path_ = "config.json";
+    mutable std::mutex mutex_;
 };

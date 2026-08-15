@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
@@ -20,21 +21,24 @@ VisionProcessor::~VisionProcessor() {
 bool VisionProcessor::init(const std::string& model_path, int camera_id, int infer_interval_ms) {
     infer_interval_ms_ = infer_interval_ms;
 
-    const AppConfig& config = ConfigManager::instance().config();
+    const AppConfig config = ConfigManager::instance().snapshot();
     camera_intrinsics_ = CameraIntrinsics{
         config.camera.fx,
         config.camera.fy,
         config.camera.cx,
         config.camera.cy
     };
-    center_filter_alpha_ = static_cast<float>(config.control.filter_alpha);
     watchdog_timeout_ms_ = config.control.heartbeat_timeout_ms;
-    safe_zone_ = SafeZone{
-        config.safety.min_x_mm,
-        config.safety.max_x_mm,
-        config.safety.min_y_mm,
-        config.safety.max_y_mm
-    };
+    {
+        std::lock_guard<std::mutex> lock(runtime_config_mutex_);
+        center_filter_alpha_ = static_cast<float>(config.control.filter_alpha);
+        safe_zone_ = SafeZone{
+            config.safety.min_x_mm,
+            config.safety.max_x_mm,
+            config.safety.min_y_mm,
+            config.safety.max_y_mm
+        };
+    }
 
     Logger::Init();
     Logger::LogInfo("System startup");
@@ -65,6 +69,67 @@ void VisionProcessor::setCoordinateDebugEnabled(bool enabled) {
 
 bool VisionProcessor::isCoordinateDebugEnabled() const {
     return coordinate_debug_enabled_.load();
+}
+
+void VisionProcessor::updateRuntimeTuning(
+    double filter_alpha,
+    double half_width_mm,
+    double half_height_mm) {
+    const double clamped_alpha = std::clamp(filter_alpha, 0.01, 1.0);
+    const double clamped_half_width = std::max(10.0, half_width_mm);
+    const double clamped_half_height = std::max(10.0, half_height_mm);
+
+    {
+        std::lock_guard<std::mutex> lock(runtime_config_mutex_);
+        center_filter_alpha_ = static_cast<float>(clamped_alpha);
+        safe_zone_ = SafeZone{
+            -clamped_half_width,
+            clamped_half_width,
+            -clamped_half_height,
+            clamped_half_height
+        };
+    }
+
+    ConfigManager::instance().updateRuntimeTuning(
+        clamped_alpha,
+        clamped_half_width,
+        clamped_half_height);
+
+    Logger::LogInfo(
+        "Runtime tuning updated: alpha=" + std::to_string(clamped_alpha) +
+        ", fence_half_width=" + std::to_string(clamped_half_width) +
+        " mm, fence_half_height=" + std::to_string(clamped_half_height) + " mm");
+}
+
+VisionTelemetry VisionProcessor::getTelemetrySnapshot() {
+    const RobotMessage message = getLatestRobotMessage();
+    const SystemState state = getSystemState();
+    const long long heartbeat_age_ms = getHeartbeatAgeMs();
+
+    VisionTelemetry telemetry;
+    telemetry.x_mm = message.world.x_mm;
+    telemetry.y_mm = message.world.y_mm;
+    telemetry.z_mm = message.world.z_mm;
+    telemetry.coordinate_valid =
+        !manual_estop_latched_ &&
+        (message.state == RobotState::SAFE || message.state == RobotState::OUT_OF_BOUNDS);
+    telemetry.heartbeat_age_ms = heartbeat_age_ms;
+    telemetry.network_online =
+        heartbeat_age_ms >= 0 && heartbeat_age_ms <= watchdog_timeout_ms_;
+    telemetry.system_state = state;
+    return telemetry;
+}
+
+void VisionProcessor::triggerEmergencyStop() {
+    std::lock_guard<std::mutex> send_lock(udp_send_mutex_);
+    if (manual_estop_latched_.exchange(true)) {
+        return;
+    }
+
+    enterEStop(EStopReason::MANUAL_TRIGGER);
+    publishRobotMessage({ RobotState::TARGET_LOST, {} });
+    sendStopCommandLocked();
+    Logger::LogCritical("Manual emergency stop triggered");
 }
 
 void VisionProcessor::publishRobotMessage(const RobotMessage& message) {
@@ -163,7 +228,9 @@ void VisionProcessor::messageLoop() {
             continue;
         }
 
-        if (system_state == SystemState::TRACKING && robot_message.state == RobotState::SAFE) {
+        if (system_state == SystemState::TRACKING &&
+            robot_message.state == RobotState::SAFE &&
+            !manual_estop_latched_) {
             if (coordinate_debug_enabled_) {
                 Logger::LogDebug(
                     "World 3D X: " + std::to_string(world.x_mm) +
@@ -178,14 +245,21 @@ void VisionProcessor::messageLoop() {
 
             std::string message = oss.str();
             const auto udp_send_start = std::chrono::high_resolution_clock::now();
-            sendto(
-                udp_socket_,
-                message.c_str(),
-                static_cast<int>(message.size()),
-                0,
-                reinterpret_cast<sockaddr*>(&udp_target_addr_),
-                sizeof(udp_target_addr_)
-            );
+            {
+                std::lock_guard<std::mutex> send_lock(udp_send_mutex_);
+                if (manual_estop_latched_) {
+                    sendStopCommandLocked();
+                    continue;
+                }
+                sendto(
+                    udp_socket_,
+                    message.c_str(),
+                    static_cast<int>(message.size()),
+                    0,
+                    reinterpret_cast<sockaddr*>(&udp_target_addr_),
+                    sizeof(udp_target_addr_)
+                );
+            }
             const auto udp_send_end = std::chrono::high_resolution_clock::now();
             updateUdpSendStats(udp_send_start, udp_send_end);
             continue;
@@ -209,20 +283,39 @@ void VisionProcessor::messageLoop() {
             }
 
             const auto udp_send_start = std::chrono::high_resolution_clock::now();
-            sendto(
-                udp_socket_,
-                stop_message,
-                static_cast<int>(std::strlen(stop_message)),
-                0,
-                reinterpret_cast<sockaddr*>(&udp_target_addr_),
-                sizeof(udp_target_addr_)
-            );
+            {
+                std::lock_guard<std::mutex> send_lock(udp_send_mutex_);
+                sendto(
+                    udp_socket_,
+                    stop_message,
+                    static_cast<int>(std::strlen(stop_message)),
+                    0,
+                    reinterpret_cast<sockaddr*>(&udp_target_addr_),
+                    sizeof(udp_target_addr_)
+                );
+            }
             const auto udp_send_end = std::chrono::high_resolution_clock::now();
             updateUdpSendStats(udp_send_start, udp_send_end);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
+}
+
+void VisionProcessor::sendStopCommandLocked() {
+    if (!udp_enabled_ || udp_socket_ == INVALID_SOCKET) {
+        return;
+    }
+
+    const char* stop_message = "CMD:STOP";
+    sendto(
+        udp_socket_,
+        stop_message,
+        static_cast<int>(std::strlen(stop_message)),
+        0,
+        reinterpret_cast<sockaddr*>(&udp_target_addr_),
+        sizeof(udp_target_addr_)
+    );
 }
 
 void VisionProcessor::watchdogLoop() {
@@ -445,13 +538,18 @@ void VisionProcessor::applyCenterFilter(InferenceResult& result) {
     }
 
     cv::Point2f raw_center = result.raw_center;
+    float filter_alpha = 0.25f;
+    {
+        std::lock_guard<std::mutex> lock(runtime_config_mutex_);
+        filter_alpha = center_filter_alpha_;
+    }
 
     if (!has_filtered_center_) {
         filtered_center_ = raw_center;
         has_filtered_center_ = true;
     } else {
-        filtered_center_.x = center_filter_alpha_ * raw_center.x + (1.0f - center_filter_alpha_) * filtered_center_.x;
-        filtered_center_.y = center_filter_alpha_ * raw_center.y + (1.0f - center_filter_alpha_) * filtered_center_.y;
+        filtered_center_.x = filter_alpha * raw_center.x + (1.0f - filter_alpha) * filtered_center_.x;
+        filtered_center_.y = filter_alpha * raw_center.y + (1.0f - filter_alpha) * filtered_center_.y;
     }
 
     result.center = filtered_center_;
@@ -490,21 +588,45 @@ VisionProcessor::WorldPoint3D VisionProcessor::pixelToWorld3D(const cv::Point2f&
 }
 
 cv::Rect VisionProcessor::getSafeZoneDisplayRect(const cv::Size& frame_size) const {
-    const int margin_x = std::max(20, frame_size.width / 8);
-    const int margin_y = std::max(20, frame_size.height / 8);
+    SafeZone safe_zone;
+    CameraIntrinsics intrinsics;
+    {
+        std::lock_guard<std::mutex> lock(runtime_config_mutex_);
+        safe_zone = safe_zone_;
+        intrinsics = camera_intrinsics_;
+    }
+
+    const double half_width_mm = std::max(std::abs(safe_zone.min_x_mm), std::abs(safe_zone.max_x_mm));
+    const double half_height_mm = std::max(std::abs(safe_zone.min_y_mm), std::abs(safe_zone.max_y_mm));
+    const int rect_width = std::clamp(
+        static_cast<int>((half_width_mm * 2.0 * intrinsics.fx) / mock_depth_mm_),
+        40,
+        std::max(40, frame_size.width - 20));
+    const int rect_height = std::clamp(
+        static_cast<int>((half_height_mm * 2.0 * intrinsics.fy) / mock_depth_mm_),
+        40,
+        std::max(40, frame_size.height - 20));
+    const int margin_x = std::max(10, (frame_size.width - rect_width) / 2);
+    const int margin_y = std::max(10, (frame_size.height - rect_height) / 2);
     return cv::Rect(
         margin_x,
         margin_y,
-        std::max(1, frame_size.width - margin_x * 2),
-        std::max(1, frame_size.height - margin_y * 2)
+        std::max(1, rect_width),
+        std::max(1, rect_height)
     );
 }
 
 bool VisionProcessor::isInsideSafeZone(const WorldPoint3D& world) const {
-    return world.x_mm >= safe_zone_.min_x_mm &&
-        world.x_mm <= safe_zone_.max_x_mm &&
-        world.y_mm >= safe_zone_.min_y_mm &&
-        world.y_mm <= safe_zone_.max_y_mm;
+    SafeZone safe_zone;
+    {
+        std::lock_guard<std::mutex> lock(runtime_config_mutex_);
+        safe_zone = safe_zone_;
+    }
+
+    return world.x_mm >= safe_zone.min_x_mm &&
+        world.x_mm <= safe_zone.max_x_mm &&
+        world.y_mm >= safe_zone.min_y_mm &&
+        world.y_mm <= safe_zone.max_y_mm;
 }
 
 void VisionProcessor::setUdpTarget(SOCKET socket, const sockaddr_in& target_addr) {
