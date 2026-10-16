@@ -13,16 +13,12 @@ jobs:
     name: Build VisionApp on Windows
     runs-on: windows-2022
 
-    defaults:
-      run:
-        working-directory: 313_part1
-
     env:
       BUILD_DIR: build/ci
       OPENCV_VERSION: 4.10.0
-      OPENCV_DIR: ${{ github.workspace }}/313_part1/third_party/opencv/build
+      OPENCV_DIR: ${{ github.workspace }}/third_party/opencv/build
       ONNXRUNTIME_VERSION: 1.18.1
-      ONNXRUNTIME_DIR: ${{ github.workspace }}/313_part1/third_party/onnxruntime-win-x64-1.18.1
+      ONNXRUNTIME_DIR: ${{ github.workspace }}/third_party/onnxruntime-win-x64-1.18.1
 
     steps:
       - name: Checkout repository
@@ -35,7 +31,7 @@ jobs:
       - name: Cache OpenCV
         uses: actions/cache@v4
         with:
-          path: 313_part1/third_party/opencv
+          path: third_party/opencv
           key: opencv-windows-${{ env.OPENCV_VERSION }}
 
       - name: Download OpenCV
@@ -61,7 +57,7 @@ jobs:
       - name: Cache ONNX Runtime
         uses: actions/cache@v4
         with:
-          path: 313_part1/third_party/onnxruntime-win-x64-1.18.1
+          path: third_party/onnxruntime-win-x64-1.18.1
           key: onnxruntime-windows-${{ env.ONNXRUNTIME_VERSION }}
 
       - name: Download ONNX Runtime
@@ -116,5 +112,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: VisionApp-windows
-          path: 313_part1/build/package
+          path: build/package
           if-no-files-found: error
