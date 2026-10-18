@@ -27,6 +27,34 @@
           "type": "PATH"
         }
       ]
+    },
+    {
+      "name": "x64-Release",
+      "generator": "Ninja",
+      "configurationType": "Release",
+      "inheritEnvironments": [ "msvc_x64_x64" ],
+      "buildRoot": "${projectDir}\\out\\build\\${name}",
+      "installRoot": "${projectDir}\\out\\install\\${name}",
+      "cmakeCommandArgs": "",
+      "buildCommandArgs": "",
+      "ctestCommandArgs": "",
+      "variables": [
+        {
+          "name": "OpenCV_DIR",
+          "value": "D:/opencv/build",
+          "type": "PATH"
+        },
+        {
+          "name": "ONNXRUNTIME_DIR",
+          "value": "D:/onnxruntime-win-x64-1.26.0/onnxruntime-win-x64-1.26.0",
+          "type": "PATH"
+        },
+        {
+          "name": "CMAKE_PREFIX_PATH",
+          "value": "D:\\qt5\\6.8.0\\msvc2022_64",
+          "type": "PATH"
+        }
+      ]
     }
   ]
 }

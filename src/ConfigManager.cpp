@@ -47,6 +47,12 @@ bool ConfigManager::load(const std::string& config_path) {
         config_.network.udp_port = valueOrDefault(network, "udp_port", config_.network.udp_port);
 
         const auto& camera = root.value("Camera", nlohmann::json::object());
+        config_.camera.backend = valueOrDefault(camera, "backend", config_.camera.backend);
+        config_.camera.source = valueOrDefault(camera, "source", config_.camera.source);
+        config_.camera.synthetic_fallback =
+            valueOrDefault(camera, "synthetic_fallback", config_.camera.synthetic_fallback);
+        config_.camera.mock_depth_mm =
+            valueOrDefault(camera, "mock_depth_mm", config_.camera.mock_depth_mm);
         config_.camera.fx = valueOrDefault(camera, "fx", config_.camera.fx);
         config_.camera.fy = valueOrDefault(camera, "fy", config_.camera.fy);
         config_.camera.cx = valueOrDefault(camera, "cx", config_.camera.cx);
@@ -84,6 +90,10 @@ bool ConfigManager::save() const {
             { "udp_port", config_.network.udp_port }
         };
         root["Camera"] = {
+            { "backend", config_.camera.backend },
+            { "source", config_.camera.source },
+            { "synthetic_fallback", config_.camera.synthetic_fallback },
+            { "mock_depth_mm", config_.camera.mock_depth_mm },
             { "fx", config_.camera.fx },
             { "fy", config_.camera.fy },
             { "cx", config_.camera.cx },

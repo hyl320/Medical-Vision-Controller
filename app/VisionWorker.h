@@ -5,8 +5,11 @@
 #include <QImage>
 #include <QObject>
 #include <QString>
+#include <QElapsedTimer>
 
 #include <atomic>
+
+class QTimer;
 
 class VisionWorker : public QObject {
     Q_OBJECT
@@ -20,6 +23,9 @@ public slots:
     void emergencyStop();
     void updateRuntimeTuning(double filter_alpha, double half_width_mm, double half_height_mm);
     void saveConfig();
+
+private slots:
+    void processNextFrame();
 
 signals:
     void frameReady(const QImage& image);
@@ -36,7 +42,15 @@ signals:
 
 private:
     static QImage matToQImage(const cv::Mat& frame);
+    bool initializeProcessor();
+    void cleanupProcessor();
+    void emitTelemetrySnapshot();
 
     std::atomic<bool> running_{ false };
     VisionProcessor processor_;
+    QTimer* frame_timer_ = nullptr;
+    QElapsedTimer telemetry_timer_;
+    SOCKET udp_socket_ = INVALID_SOCKET;
+    bool winsock_started_ = false;
+    bool cleanup_done_ = true;
 };

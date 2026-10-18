@@ -25,17 +25,22 @@ int main(int argc, char* argv[]) {
     const bool headless = hasHeadlessFlag(argc, argv);
 
     if (headless) {
+        QCoreApplication app(argc, argv);
         Logger::LogInfo("System started in HEADLESS mode.");
 
-        QThread worker_thread;
-        VisionWorker worker;
-        worker.moveToThread(&worker_thread);
+        auto* worker_thread = new QThread(&app);
+        auto* worker = new VisionWorker();
+        worker->moveToThread(worker_thread);
 
-        QObject::connect(&worker_thread, &QThread::started, &worker, &VisionWorker::start);
-        QObject::connect(&worker, &VisionWorker::finished, &worker_thread, &QThread::quit);
+        QObject::connect(worker_thread, &QThread::started, worker, &VisionWorker::start);
+        QObject::connect(&app, &QCoreApplication::aboutToQuit, worker, &VisionWorker::stop);
+        QObject::connect(worker, &VisionWorker::finished, worker_thread, &QThread::quit);
+        QObject::connect(worker, &VisionWorker::finished, worker, &VisionWorker::deleteLater);
+        QObject::connect(worker_thread, &QThread::finished, worker_thread, &QThread::deleteLater);
+        QObject::connect(worker_thread, &QThread::finished, &app, &QCoreApplication::quit);
 
-        worker_thread.start();
-        return worker_thread.wait() ? 0 : 1;
+        worker_thread->start();
+        return app.exec();
     }
 
     QApplication app(argc, argv);
@@ -56,31 +61,26 @@ int main(int argc, char* argv[]) {
         &window,
         &MainWindow::runtimeTuningChanged,
         worker,
-        &VisionWorker::updateRuntimeTuning,
-        Qt::DirectConnection);
+        &VisionWorker::updateRuntimeTuning);
     QObject::connect(
         &window,
         &MainWindow::saveConfigRequested,
         worker,
-        &VisionWorker::saveConfig,
-        Qt::DirectConnection);
+        &VisionWorker::saveConfig);
     QObject::connect(worker, &VisionWorker::configSaved, &window, &MainWindow::updateConfigSaveStatus);
     QObject::connect(
         &window,
         &MainWindow::emergencyStopRequested,
         worker,
-        &VisionWorker::emergencyStop,
-        Qt::DirectConnection);
+        &VisionWorker::emergencyStop);
     QObject::connect(worker, &VisionWorker::finished, worker_thread, &QThread::quit);
     QObject::connect(worker, &VisionWorker::finished, worker, &VisionWorker::deleteLater);
     QObject::connect(worker_thread, &QThread::finished, worker_thread, &QThread::deleteLater);
-    QObject::connect(&app, &QApplication::aboutToQuit, worker, &VisionWorker::stop, Qt::DirectConnection);
+    QObject::connect(&app, &QApplication::aboutToQuit, worker, &VisionWorker::stop);
 
     worker_thread->start();
 
     const int exit_code = app.exec();
-    worker->stop();
-    worker_thread->quit();
     worker_thread->wait();
 
     return exit_code;

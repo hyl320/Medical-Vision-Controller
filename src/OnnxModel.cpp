@@ -17,9 +17,25 @@ constexpr int kProtoW = 160;
 constexpr float kConfThreshold = 0.25f;
 constexpr float kNmsThreshold = 0.45f;
 constexpr float kMaskThreshold = 0.5f;
+constexpr const char* kClassNames[kNumClasses] = {
+    "back",
+    "neck",
+    "buttocks",
+    "legs",
+    "arms",
+    "abdomen",
+    "face"
+};
 
 float sigmoid(float x) {
     return 1.0f / (1.0f + std::exp(-x));
+}
+
+std::string classNameFor(int class_id) {
+    if (class_id >= 0 && class_id < kNumClasses) {
+        return kClassNames[class_id];
+    }
+    return "class " + std::to_string(class_id);
 }
 
 bool shouldLogNow() {
@@ -56,7 +72,10 @@ bool OnnxModel::load(const std::string& model_path) {
     try {
 #ifdef _WIN32
         std::wstring wide_model_path(model_path.begin(), model_path.end());
-        session_ = std::make_unique<Ort::Session>(env_, wide_model_path.c_str(), session_options_);
+        session_ = std::make_unique<Ort::Session>(
+            env_, 
+            wide_model_path.c_str(), 
+            session_options_);
 #else
         session_ = std::make_unique<Ort::Session>(env_, model_path.c_str(), session_options_);
 #endif
@@ -383,7 +402,7 @@ void OnnxModel::drawResult(cv::Mat& image, const InferenceResult& result) const 
 
     for (const Detection& detection : result.detections) {
         cv::rectangle(image, detection.box, cv::Scalar(0, 255, 0), 2);
-        std::string label = "class " + std::to_string(detection.class_id) + " " + std::to_string(detection.score).substr(0, 4);
+        std::string label = classNameFor(detection.class_id) + " " + std::to_string(detection.score).substr(0, 4);
         int label_top = std::max(detection.box.y - 5, 15);
         cv::putText(image, label, cv::Point(detection.box.x, label_top), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
     }

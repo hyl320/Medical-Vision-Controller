@@ -9,6 +9,10 @@ struct NetworkConfig {
 };
 
 struct CameraConfig {
+    std::string backend = "mock";
+    std::string source;
+    bool synthetic_fallback = true;
+    double mock_depth_mm = 500.0;
     double fx = 500.0;
     double fy = 500.0;
     double cx = 320.0;

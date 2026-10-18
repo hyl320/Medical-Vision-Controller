@@ -4,6 +4,10 @@
     "udp_port": 8888
   },
   "Camera": {
+    "backend": "mock",
+    "source": "",
+    "synthetic_fallback": true,
+    "mock_depth_mm": 500.0,
     "fx": 500.0,
     "fy": 500.0,
     "cx": 320.0,

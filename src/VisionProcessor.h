@@ -8,12 +8,13 @@
 #include <ws2tcpip.h>
 
 #include "OnnxModel.h"
-#include "VisionSensor.h"
+#include "CameraBase.h"
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -59,13 +60,6 @@ public:
     void stop();
 
 private:
-    struct CameraIntrinsics {
-        double fx = 500.0;
-        double fy = 500.0;
-        double cx = 320.0;
-        double cy = 240.0;
-    };
-
     struct WorldPoint3D {
         double x_mm = 0.0;
         double y_mm = 0.0;
@@ -123,7 +117,15 @@ private:
     void applyCenterFilter(InferenceResult& result);
 
     cv::Point2f modelPointToCameraPixel(const cv::Point2f& model_point, const cv::Size& camera_size) const;
-    WorldPoint3D pixelToWorld3D(const cv::Point2f& pixel_point) const;
+    WorldPoint3D pixelToWorld3D(
+        const cv::Point2f& pixel_point,
+        const cv::Mat& depth_frame,
+        const CameraIntrinsics& intrinsics,
+        double depth_scale_mm) const;
+    double depthAtPixelMm(
+        const cv::Mat& depth_frame,
+        const cv::Point2f& pixel_point,
+        double depth_scale_mm) const;
     bool isInsideSafeZone(const WorldPoint3D& world) const;
     cv::Rect getSafeZoneDisplayRect(const cv::Size& frame_size) const;
     void drawUiOverlay(cv::Mat& frame, const RobotMessage& message, SystemState state) const;
@@ -141,7 +143,7 @@ private:
         const std::chrono::high_resolution_clock::time_point& udp_send_end);
     PerformanceStats getPerformanceStats() const;
 
-    VisionSensor sensor_;
+    CameraPtr camera_;
     OnnxModel model_;
 
     int infer_interval_ms_ = 300;
@@ -166,6 +168,8 @@ private:
     std::condition_variable world_cv_;
 
     cv::Mat latest_camera_frame_;
+    cv::Mat latest_depth_frame_;
+    double latest_depth_scale_mm_ = 1.0;
     InferenceResult latest_result_;
 
     RobotMessage latest_robot_message_;
@@ -176,7 +180,7 @@ private:
     cv::Point2f filtered_center_{ -1.0f, -1.0f };
 
     CameraIntrinsics camera_intrinsics_{};
-    const double mock_depth_mm_ = 500.0;
+    double reference_depth_mm_ = 500.0;
     SafeZone safe_zone_{};
     SystemState system_state_ = SystemState::STANDBY;
     EStopReason estop_reason_ = EStopReason::NONE;

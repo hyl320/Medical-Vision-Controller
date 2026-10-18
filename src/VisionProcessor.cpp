@@ -3,6 +3,8 @@
 
 #include "Letterbox.h"
 #include "Logger.h"
+#include "MockCamera.h"
+#include "RealSenseCamera.h"
 
 #include <algorithm>
 #include <chrono>
@@ -11,6 +13,19 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <vector>
+
+namespace {
+CameraPtr createCamera(const CameraConfig& config) {
+    if (config.backend == "realsense") {
+        return std::make_unique<RealSenseCamera>();
+    }
+
+    return std::make_unique<MockCamera>(
+        config.mock_depth_mm,
+        config.synthetic_fallback);
+}
+}
 
 VisionProcessor::VisionProcessor() = default;
 
@@ -28,6 +43,7 @@ bool VisionProcessor::init(const std::string& model_path, int camera_id, int inf
         config.camera.cx,
         config.camera.cy
     };
+    reference_depth_mm_ = std::max(1.0, config.camera.mock_depth_mm);
     watchdog_timeout_ms_ = config.control.heartbeat_timeout_ms;
     {
         std::lock_guard<std::mutex> lock(runtime_config_mutex_);
@@ -50,9 +66,11 @@ bool VisionProcessor::init(const std::string& model_path, int camera_id, int inf
 
     model_.printModelInfo();
 
-    if (!sensor_.initialize(camera_id)) {
+    camera_ = createCamera(config.camera);
+    if (!camera_ || !camera_->initialize(camera_id, config.camera.source)) {
         return false;
     }
+    Logger::LogInfo(std::string("Camera backend: ") + camera_->name());
 
     running_ = true;
     message_thread_ = std::thread(&VisionProcessor::messageLoop, this);
@@ -158,17 +176,34 @@ bool VisionProcessor::processFrame(cv::Mat& output_frame) {
     long long heartbeat_age_ms = getHeartbeatAgeMs();
 
     const auto camera_read_start = std::chrono::high_resolution_clock::now();
-    cv::Mat current_frame;
-    if (!sensor_.getNextFrame(current_frame)) {
+    RgbdFrame sensor_frame;
+    if (!camera_ || !camera_->getNextFrame(sensor_frame) || !sensor_frame.isValid()) {
         return false;
     }
     const auto camera_read_end = std::chrono::high_resolution_clock::now();
 
     {
         std::lock_guard<std::mutex> lock(frame_mutex_);
-        latest_camera_frame_ = current_frame.clone();
+        latest_camera_frame_ = sensor_frame.color.clone();
+        latest_depth_frame_ = sensor_frame.depth.clone();
+        latest_depth_scale_mm_ = sensor_frame.depth_scale_mm;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(runtime_config_mutex_);
+        camera_intrinsics_ = sensor_frame.color_intrinsics;
+        const double center_depth_mm = depthAtPixelMm(
+            sensor_frame.depth,
+            cv::Point2f(
+                sensor_frame.depth.cols * 0.5f,
+                sensor_frame.depth.rows * 0.5f),
+            sensor_frame.depth_scale_mm);
+        if (center_depth_mm > 0.0) {
+            reference_depth_mm_ = center_depth_mm;
+        }
+    }
+
+    const cv::Mat& current_frame = sensor_frame.color;
     output_frame = Letterbox(current_frame, cv::Size(640, 640));
     updateFrameStats(frame_time, camera_read_start, camera_read_end);
 
@@ -200,6 +235,9 @@ void VisionProcessor::stop() {
     if (watchdog_socket_ != INVALID_SOCKET) {
         closesocket(watchdog_socket_);
         watchdog_socket_ = INVALID_SOCKET;
+    }
+    if (camera_) {
+        camera_->stop();
     }
 }
 
@@ -476,10 +514,15 @@ void VisionProcessor::inferenceLoop() {
         }
 
         cv::Mat frame_for_infer;
+        cv::Mat depth_for_infer;
+        double depth_scale_mm = 1.0;
+        CameraIntrinsics intrinsics;
         {
             std::lock_guard<std::mutex> lock(frame_mutex_);
             if (!latest_camera_frame_.empty()) {
                 frame_for_infer = latest_camera_frame_.clone();
+                depth_for_infer = latest_depth_frame_.clone();
+                depth_scale_mm = latest_depth_scale_mm_;
             }
         }
 
@@ -510,7 +553,15 @@ void VisionProcessor::inferenceLoop() {
                 publishRobotMessage({ RobotState::TARGET_LOST, {} });
             } else {
                 cv::Point2f camera_pixel = modelPointToCameraPixel(result.center, frame_for_infer.size());
-                WorldPoint3D world = pixelToWorld3D(camera_pixel);
+                {
+                    std::lock_guard<std::mutex> lock(runtime_config_mutex_);
+                    intrinsics = camera_intrinsics_;
+                }
+                WorldPoint3D world = pixelToWorld3D(
+                    camera_pixel,
+                    depth_for_infer,
+                    intrinsics,
+                    depth_scale_mm);
 
                 if (!isInsideSafeZone(world)) {
                     Logger::LogCritical("Electronic fence breach");
@@ -579,12 +630,64 @@ cv::Point2f VisionProcessor::modelPointToCameraPixel(const cv::Point2f& model_po
     return cv::Point2f((model_point.x - pad_x) / scale, (model_point.y - pad_y) / scale);
 }
 
-VisionProcessor::WorldPoint3D VisionProcessor::pixelToWorld3D(const cv::Point2f& pixel_point) const {
+VisionProcessor::WorldPoint3D VisionProcessor::pixelToWorld3D(
+    const cv::Point2f& pixel_point,
+    const cv::Mat& depth_frame,
+    const CameraIntrinsics& intrinsics,
+    double depth_scale_mm) const {
     WorldPoint3D world;
-    world.z_mm = mock_depth_mm_;
-    world.x_mm = (static_cast<double>(pixel_point.x) - camera_intrinsics_.cx) * mock_depth_mm_ / camera_intrinsics_.fx;
-    world.y_mm = (static_cast<double>(pixel_point.y) - camera_intrinsics_.cy) * mock_depth_mm_ / camera_intrinsics_.fy;
+    world.z_mm = depthAtPixelMm(depth_frame, pixel_point, depth_scale_mm);
+    if (world.z_mm <= 0.0 || intrinsics.fx <= 0.0 || intrinsics.fy <= 0.0) {
+        return {};
+    }
+
+    world.x_mm =
+        (static_cast<double>(pixel_point.x) - intrinsics.cx) * world.z_mm / intrinsics.fx;
+    world.y_mm =
+        (static_cast<double>(pixel_point.y) - intrinsics.cy) * world.z_mm / intrinsics.fy;
     return world;
+}
+
+double VisionProcessor::depthAtPixelMm(
+    const cv::Mat& depth_frame,
+    const cv::Point2f& pixel_point,
+    double depth_scale_mm) const {
+    if (depth_frame.empty() ||
+        depth_frame.type() != CV_16UC1 ||
+        depth_scale_mm <= 0.0) {
+        return 0.0;
+    }
+
+    const int center_x = static_cast<int>(std::lround(pixel_point.x));
+    const int center_y = static_cast<int>(std::lround(pixel_point.y));
+    if (center_x < 0 || center_y < 0 ||
+        center_x >= depth_frame.cols || center_y >= depth_frame.rows) {
+        return 0.0;
+    }
+
+    std::vector<double> valid_depths;
+    valid_depths.reserve(25);
+    for (int y = std::max(0, center_y - 2);
+         y <= std::min(depth_frame.rows - 1, center_y + 2);
+         ++y) {
+        for (int x = std::max(0, center_x - 2);
+             x <= std::min(depth_frame.cols - 1, center_x + 2);
+             ++x) {
+            const std::uint16_t raw_depth =
+                depth_frame.at<std::uint16_t>(y, x);
+            if (raw_depth > 0) {
+                valid_depths.push_back(
+                    static_cast<double>(raw_depth) * depth_scale_mm);
+            }
+        }
+    }
+
+    if (valid_depths.empty()) {
+        return 0.0;
+    }
+
+    std::sort(valid_depths.begin(), valid_depths.end());
+    return valid_depths[valid_depths.size() / 2];
 }
 
 cv::Rect VisionProcessor::getSafeZoneDisplayRect(const cv::Size& frame_size) const {
@@ -599,11 +702,11 @@ cv::Rect VisionProcessor::getSafeZoneDisplayRect(const cv::Size& frame_size) con
     const double half_width_mm = std::max(std::abs(safe_zone.min_x_mm), std::abs(safe_zone.max_x_mm));
     const double half_height_mm = std::max(std::abs(safe_zone.min_y_mm), std::abs(safe_zone.max_y_mm));
     const int rect_width = std::clamp(
-        static_cast<int>((half_width_mm * 2.0 * intrinsics.fx) / mock_depth_mm_),
+        static_cast<int>((half_width_mm * 2.0 * intrinsics.fx) / reference_depth_mm_),
         40,
         std::max(40, frame_size.width - 20));
     const int rect_height = std::clamp(
-        static_cast<int>((half_height_mm * 2.0 * intrinsics.fy) / mock_depth_mm_),
+        static_cast<int>((half_height_mm * 2.0 * intrinsics.fy) / reference_depth_mm_),
         40,
         std::max(40, frame_size.height - 20));
     const int margin_x = std::max(10, (frame_size.width - rect_width) / 2);
@@ -641,7 +744,24 @@ void VisionProcessor::printWorldCoordinate(const cv::Point2f& model_center, cons
         return;
     }
 
-    WorldPoint3D world = pixelToWorld3D(camera_pixel);
+    cv::Mat depth_frame;
+    double depth_scale_mm = 1.0;
+    CameraIntrinsics intrinsics;
+    {
+        std::lock_guard<std::mutex> frame_lock(frame_mutex_);
+        depth_frame = latest_depth_frame_.clone();
+        depth_scale_mm = latest_depth_scale_mm_;
+    }
+    {
+        std::lock_guard<std::mutex> config_lock(runtime_config_mutex_);
+        intrinsics = camera_intrinsics_;
+    }
+
+    WorldPoint3D world = pixelToWorld3D(
+        camera_pixel,
+        depth_frame,
+        intrinsics,
+        depth_scale_mm);
     publishWorldCoordinate(world);
 }
 
